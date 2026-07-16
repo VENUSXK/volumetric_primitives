@@ -10,6 +10,7 @@ import mitsuba as mi
 
 from mitsuba.ad.integrators.common import RBIntegrator
 from .common import *
+from .common import _RAY_FLAGS_BACKFACE_CULLING
 
 class VolumetricPrimitiveTomographyIntegrator(RBIntegrator):
     '''
@@ -71,7 +72,7 @@ class VolumetricPrimitiveTomographyIntegrator(RBIntegrator):
             si = scene.ray_intersect(
                 ray,
                 coherent=(depth == 0),
-                ray_flags=mi.RayFlags.All | mi.RayFlags.BackfaceCulling,
+                ray_flags=mi.RayFlags.All | _RAY_FLAGS_BACKFACE_CULLING,
                 active=active,
             )
 

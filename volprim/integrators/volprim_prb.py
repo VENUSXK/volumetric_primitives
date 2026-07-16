@@ -10,6 +10,7 @@ import mitsuba as mi
 
 from mitsuba.ad.integrators.common import RBIntegrator, mis_weight
 from .common import *
+from .common import _RAY_FLAGS_BACKFACE_CULLING
 from .stack import alloc_stack
 
 class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
@@ -56,6 +57,8 @@ class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
         props['kernel_normalized'] = False
         self.kernel = Kernel.factory(props)
 
+        self.kernel_has_inv_cdf = type(self.kernel).inv_cdf is not Kernel.inv_cdf
+
         self.max_overlaps        = int(props.get("max_overlaps", 32))
         self.max_depth_primitive = int(props.get("max_depth_primitive", 256))
         self.rr_depth_primitive  = int(props.get("rr_depth_primitive",  256))
@@ -65,8 +68,8 @@ class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
         assert self.solver_type in ['bisection', 'newton', 'disabled']
 
     def traverse(self, callback):
-        callback.put_parameter("max_depth",  self.max_depth,  mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter("rr_depth",   self.rr_depth,   mi.ParamFlags.NonDifferentiable)
+        callback.put("max_depth",  self.max_depth,  mi.ParamFlags.NonDifferentiable)
+        callback.put("rr_depth",   self.rr_depth,   mi.ParamFlags.NonDifferentiable)
 
     def parameters_changed(self, keys):
         pass
@@ -366,7 +369,7 @@ class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
         active2 = mi.Bool(active)
         while active2:
             # Find the next Gaussian along the ray
-            si = scene.ray_intersect(ray, coherent=False, ray_flags=(mi.RayFlags.All | mi.RayFlags.BackfaceCulling), active=active2)
+            si = scene.ray_intersect(ray, coherent=False, ray_flags=(mi.RayFlags.All | _RAY_FLAGS_BACKFACE_CULLING), active=active2)
             active2 &= si.is_valid()
 
             # TODO handle the case where we hit a surface
@@ -563,17 +566,24 @@ class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
         '''
         active = mi.Bool(active) & ~primitives.is_empty()
 
-        if False: # TODO handle case where we have a single primitive
-            # Handle the case where we have a single primitive
+        # Fast path: lanes whose segment overlaps a single primitive admit a
+        # closed-form free-flight sample via the kernel's analytic inverse
+        # CDF; no Newton/bisection iterations are needed there. Lanes whose
+        # requested optical depth is unreachable (the ray escapes the
+        # primitive: t_s = +inf) or whose sample lies outside the segment
+        # fall through to the iterative solver below.
+        single_success = mi.Bool(False)
+        t_single = mi.Float(0.0)
+        if self.kernel_has_inv_cdf:
             single_case = active & (primitives.size() == 1)
             prim_id = primitives.value(0, single_case)
-            ellipsoid = Ellipsoid.gather(prim_id.shape, prim_id.index, active1)
+            ellipsoid = Ellipsoid.gather(prim_id.shape, prim_id.index, single_case)
             si1 = dr.zeros(mi.SurfaceInteraction3f)
             si1.prim_index = prim_id.index
-            sigma_t = prim_id.shape.eval_attribute_1('sigma_t', si1, active1)
-            t_s = self.kernel.inv_cdf(ray, ellipsoid, sigmat, sample / β, single_case)
-            success = single_case & (t_s > seg_t0) & (t_s < seg_t1)
-            active &= ~success
+            sigma_t = prim_id.shape.eval_attribute_1('sigma_t', si1, single_case)
+            t_single = self.kernel.inv_cdf(ray, ellipsoid, sigma_t, sample / β, single_case)
+            single_success = single_case & (t_single > seg_t0) & (t_single < seg_t1)
+            active &= ~single_success
 
         # Initial guess for the Newton solver
         t_s = (seg_t0 + seg_t1) / 2.0
@@ -651,6 +661,7 @@ class VolumetricPrimitivesPRBIntegrator(RBIntegrator):
             active &= (it < self.solver_max_iterations)
             active &= (dr.abs(step) > 5e-6) # TODO select this value according to something (i.e minimum intersection displacement? can possibly be bigger, this is very safe)
 
+        t_s = dr.select(single_success, t_single, t_s)
         return t_s
 
     def to_string(self):

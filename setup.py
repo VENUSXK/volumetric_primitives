@@ -13,6 +13,8 @@ setup(
     description="A Mitsuba extension library for ray tracing volumetric primitives",
     python_requires=">=3.8",
     install_requires=[
+        'mitsuba>=3.9',
+        'drjit>=1.4',
         'ipywidgets',
         'matplotlib',
         'numpy',

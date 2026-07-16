@@ -10,6 +10,7 @@ import mitsuba as mi
 
 from mitsuba.ad.integrators.common import RBIntegrator
 from .common import *
+from .common import _RAY_FLAGS_BACKFACE_CULLING
 
 class VolumetricPrimitiveRadianceFieldIntegrator(RBIntegrator):
     '''
@@ -46,11 +47,11 @@ class VolumetricPrimitiveRadianceFieldIntegrator(RBIntegrator):
         self.kernel = Kernel.factory(props)
 
     def traverse(self, callback):
-        callback.put_parameter("max_depth",       self.max_depth,       mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter("rr_depth",        self.rr_depth,        mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter('srgb_primitives', self.srgb_primitives, mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter('kernel_type',     self.kernel.type,     mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter('hide_emitters',   self.hide_emitters,   mi.ParamFlags.NonDifferentiable)
+        callback.put("max_depth",       self.max_depth,       mi.ParamFlags.NonDifferentiable)
+        callback.put("rr_depth",        self.rr_depth,        mi.ParamFlags.NonDifferentiable)
+        callback.put('srgb_primitives', self.srgb_primitives, mi.ParamFlags.NonDifferentiable)
+        callback.put('kernel_type',     self.kernel.type,     mi.ParamFlags.NonDifferentiable)
+        callback.put('hide_emitters',   self.hide_emitters,   mi.ParamFlags.NonDifferentiable)
 
     def parameters_changed(self, keys):
         if 'kernel_type' in keys:
@@ -124,7 +125,7 @@ class VolumetricPrimitiveRadianceFieldIntegrator(RBIntegrator):
             si = scene.ray_intersect(
                 ray,
                 coherent=(depth == 0),
-                ray_flags=mi.RayFlags.All | mi.RayFlags.BackfaceCulling,
+                ray_flags=mi.RayFlags.All | _RAY_FLAGS_BACKFACE_CULLING,
                 active=active,
             )
 

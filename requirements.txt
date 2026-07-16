@@ -5,4 +5,5 @@ ipywidgets
 rich
 setuptools
 plyfile
-mitsuba
+mitsuba>=3.9
+drjit>=1.4

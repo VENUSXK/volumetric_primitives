@@ -313,7 +313,7 @@ def clean_and_reset_drjit(clear_cache: bool=True) -> None:
     gc.collect()
     gc.collect()
     _dr.flush_malloc_cache()
-    _dr.malloc_clear_statistics()
+    _dr.detail.malloc_clear_statistics()
     if clear_cache:
         clear_cache_folders()
         _dr.flush_kernel_cache()

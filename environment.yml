@@ -13,4 +13,5 @@ dependencies:
   - setuptools
   - pip:
       - plyfile
-      - mitsuba
+      - mitsuba>=3.9
+      - drjit>=1.4

@@ -22,23 +22,36 @@ def get_plugin_type(obj):
     Fetch the plugin type name for a given instance.
     This function also handle the corner cases of expanded objects
     '''
-    alias = obj.class_().alias()
-    if alias == 'scene':
+    if isinstance(obj, mi.Scene):
         return 'scene'
-    plugin_type = mi.PluginManager.instance().get_plugin_type(alias)
-    if alias == 'CppADIntegrator':
-        plugin_type = {
-            "<class 'volprim.integrators.volprim_rf.VolumetricPrimitiveRadianceFieldIntegrator'>": 'volprim_rf',
-            "<class 'volprim.integrators.volprim_tomography.VolumetricPrimitiveTomographyIntegrator'>": 'volprim_tomography',
-            "<class 'volprim.integrators.volprim_prb.VolumetricPrimitivesPRBIntegrator'>": 'volprim_prb',
-            "<class 'mitsuba.ad.integrators.prb.PRBIntegrator'>": 'prb',
-        }[str(type(obj))]
-    elif plugin_type == '':
-        plugin_type = {
-            'BitmapTextureImpl_FP16': 'bitmap',
-            'BitmapTextureImpl': 'bitmap',
-        }[alias]
-    return plugin_type
+    if hasattr(obj, 'class_') and callable(obj.class_):
+        cname = obj.class_().alias()
+    elif hasattr(obj, 'class_name'):
+        cname = obj.class_name()
+    else:
+        cname = type(obj).__name__
+    if cname in ('scene', 'Scene'):
+        return 'scene'
+    if cname in ('SamplingIntegrator', 'CppADIntegrator', 'ADIntegrator', 'RBIntegrator'):
+        return {
+            'PRBIntegrator': 'prb',
+            'VolumetricPrimitiveRadianceFieldIntegrator': 'volprim_rf',
+            'VolumetricPrimitiveTomographyIntegrator': 'volprim_tomography',
+            'VolumetricPrimitivesPRBIntegrator': 'volprim_prb',
+        }.get(type(obj).__name__, cname.lower())
+    class_to_plugin = {
+        'PerspectiveCamera': 'perspective', 'ProjectiveCamera': 'perspective',
+        'OrthographicCamera': 'orthographic', 'ThinLensCamera': 'thinlens',
+        'ConstantBackgroundEmitter': 'constant', 'EnvironmentMapEmitter': 'envmap',
+        'PointLight': 'point', 'DirectionalEmitter': 'directional',
+        'SpotLight': 'spot', 'AreaLight': 'area',
+        'SRGBReflectanceSpectrum': 'srgb', 'SRGBEmitterSpectrum': 'srgb',
+        'IndependentSampler': 'independent',
+        'BitmapTextureImpl_FP16': 'bitmap', 'BitmapTextureImpl': 'bitmap',
+    }
+    if cname in class_to_plugin:
+        return class_to_plugin[cname]
+    return cname.lower()
 
 def asset_to_dict(asset,
                   objects=True,
@@ -236,7 +249,7 @@ def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False):
     emitters = {}
     objects  = {}
     for k, v in scene_dict.items():
-        if isinstance(v, str) and v == 'scene':
+        if not isinstance(v, dict) or 'type' not in v:
             continue
         if v['type'] in sensor_types:
             sensors[k] = v
@@ -287,6 +300,12 @@ def object_to_dict(root):
                 self._plugin_type = get_plugin_type(node)
                 self._dict = { 'type': self._plugin_type }
 
+        def put(self, name, value, flags, value_type=None):
+            if isinstance(value, mi.Object):
+                self.put_object(name, value, flags)
+            else:
+                self.put_parameter(name, value, flags, value_type)
+
         def put_parameter(self, name, value, flags, value_type=None):
             # Filter out some of the parameters
             if name in ['enabled', 'silhouette_sampling_weight', 'sampling_weight']:
@@ -310,13 +329,17 @@ def object_to_dict(root):
             node.traverse(cb)
 
             plugin_type = cb._plugin_type
-            parent_name = node.class_().parent().name()
+
+            if hasattr(node, 'class_') and callable(node.class_):
+                parent_name = node.class_().parent().name()
+            else:
+                parent_name = type(node).__mro__[1].__name__ if len(type(node).__mro__) > 1 else ''
 
             # Handle special cases
             d = cb._dict
 
             # Meshes
-            if parent_name == 'Mesh' and 'faces' in d:
+            if (parent_name == 'Mesh' or isinstance(node, mi.Mesh)) and 'faces' in d:
                 d['type'] = 'meshholder'
             # Ellipsoids
             elif 'ellipsoid' in plugin_type:
