@@ -382,53 +382,103 @@ def object_to_dict(root):
     cb.put_object('root', root, None)
     return cb._dict['root']
 
-def ellipsoid_dict_to_ply(d, extras_keys, filename):
-    '''
-    Export an dictionary representing an ellipsoid shape into a PLY file.
-    '''
+def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=False):
+    """Write shared columns or independent Gaussian parameters from a dictionary."""
     import plyfile
 
-    is_3dg = 'sh_coeffs' in extras_keys and 'opacities' in extras_keys
-    extras = { k: d[k].shape[1] for k in extras_keys }
+    if use_columns_representation:
+        # read shared footprints and independent axial parameters from the dictionary.
+        centers = np.asarray(d['column_center_xz'], dtype=np.float32)
+        scales = np.asarray(d['column_scale_xz'], dtype=np.float32)
+        angles = np.asarray(d['column_rotation_angle'], dtype=np.float32).reshape(-1)
+        axial_centers = np.asarray(d['primitive_center_y'], dtype=np.float32).reshape(-1)
+        axial_scales = np.asarray(d['primitive_scale_y'], dtype=np.float32).reshape(-1)
+        opacities = np.asarray(d['primitive_opacity'], dtype=np.float32).reshape(-1)
 
-    centers     = np.array(d['centers'])
-    scales      = np.array(np.log(np.maximum(d['scales'], 1e-6)))
-    quaternions = np.array(d['quaternions'])[:, [3, 0, 1, 2]] # Reorder (i, j, k, r -> r, i, j, k)
-    normals     = np.zeros_like(centers)
+        # check the fixed-size column layout before writing any records.
+        primitives_per_column = int(d['primitives_per_column'])
+        column_count = len(centers)
+        primitive_count = len(axial_centers)
+        if centers.shape != (column_count, 2) or scales.shape != centers.shape or len(angles) != column_count:
+            raise ValueError('Column centers and scales must have shape (M, 2), with one angle per column')
+        if primitives_per_column <= 0 or column_count == 0 or primitive_count != column_count * primitives_per_column:
+            raise ValueError('Primitive count must equal column count times primitives_per_column')
+        if axial_scales.shape != axial_centers.shape or opacities.shape != axial_centers.shape:
+            raise ValueError('Axial centers, scales, and opacities must have matching lengths')
 
-    if is_3dg:
-        sh_coeffs = np.array(d['sh_coeffs'])
-        f_dc   = sh_coeffs[:, :3]
-        f_rest = sh_coeffs[:, 3:]
+        # preserve finite physical scales and density weights without log transforms.
+        if not all(np.isfinite(values).all() for values in (centers, scales, angles, axial_centers, axial_scales, opacities)):
+            raise ValueError('Column parameters must be finite')
+        if np.any(scales <= 0) or np.any(axial_scales <= 0):
+            raise ValueError('Column and primitive scales must be positive')
 
-        if f_rest.shape[1] > 0:
-            # Re-ordering the spherical harmonic coefficients!
-            sh_n = (f_rest.shape[1] // 3) + 1
-            col_mapping = sum([[(j*3+0-3, j-1+3-3), (j*3+1-3,j-1+sh_n+2-3), (j*3+2-3, j-1+2*sh_n+1-3)] for j in range(1, sh_n)], [])
-            col_indices = [a for a, b in sorted(col_mapping, key=lambda x: x[1])]
-            f_rest = f_rest[:, col_indices]
+        # store uniform rendering attributes once for the entire file.
+        extent = np.asarray(d.get('extent', 3.0), dtype=np.float32).reshape(-1)
+        albedo = np.asarray(d.get('albedo', [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1, 3)
+        if not extent.size or not np.isfinite(extent).all() or np.any(extent <= 0) or not np.all(extent == extent[0]):
+            raise ValueError('Column PLY requires one uniform positive extent')
+        if not len(albedo) or not np.isfinite(albedo).all() or not np.all(albedo == albedo[0]):
+            raise ValueError('Column PLY requires one uniform RGB albedo')
+        metadata = np.array([(1, primitives_per_column, extent[0], *albedo[0])], dtype=[('format_version', 'u4'), ('primitives_per_column', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')])
 
-        opacities = np.clip(d['opacities'], 1e-8, 1.0 - 1e-8)
-        opacities = np.array(np.log(opacities) -  np.log(1.0 - opacities))
-        extras_data = [f_dc, f_rest, opacities]
+        # write each shared footprint exactly once.
+        column_fields = ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle')
+        column_records = np.empty(column_count, dtype=[(name, 'f4') for name in column_fields])
+        for name, values in zip(column_fields, (centers[:, 0], centers[:, 1], scales[:, 0], scales[:, 1], angles)):
+            column_records[name] = values
+
+        # keep primitive records contiguous within each column.
+        primitive_fields = ('center_y', 'scale_y', 'opacity')
+        primitive_records = np.empty(primitive_count, dtype=[(name, 'f4') for name in primitive_fields])
+        for name, values in zip(primitive_fields, (axial_centers, axial_scales, opacities)):
+            primitive_records[name] = values
+        ply_elements = [plyfile.PlyElement.describe(metadata, 'metadata'), plyfile.PlyElement.describe(column_records, 'column'), plyfile.PlyElement.describe(primitive_records, 'primitive')]
     else:
-        extras_data = [d[k] for k, dim in extras.items()]
+        # preserve the existing gaussian and spherical harmonic export formats.
+        is_3dg = 'sh_coeffs' in extras_keys and 'opacities' in extras_keys
+        extras = { k: d[k].shape[1] for k in extras_keys }
 
-    attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-    if is_3dg:
-        attributes += ['f_dc_0', 'f_dc_1', 'f_dc_2']
-        for i in range(extras['sh_coeffs'] - 3):
-            attributes.append(f'f_rest_{i}')
-        attributes += ['opacity']
-    else:
-        for k, dim in extras.items():
-            for i in range(dim):
-                attributes.append(f'{k}_{i}')
-    attributes += ['scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3']
+        centers     = np.array(d['centers'])
+        scales      = np.array(np.log(np.maximum(d['scales'], 1e-6)))
+        quaternions = np.array(d['quaternions'])[:, [3, 0, 1, 2]] # Reorder (i, j, k, r -> r, i, j, k)
+        normals     = np.zeros_like(centers)
 
-    elements = np.empty(centers.shape[0], dtype=[(attr, 'f4') for attr in attributes])
-    attributes = np.concatenate((centers, normals, *extras_data, scales, quaternions), axis=1)
-    elements[:] = list(map(tuple, attributes))
-    el = plyfile.PlyElement.describe(elements, 'vertex')
+        if is_3dg:
+            sh_coeffs = np.array(d['sh_coeffs'])
+            f_dc   = sh_coeffs[:, :3]
+            f_rest = sh_coeffs[:, 3:]
+
+            if f_rest.shape[1] > 0:
+                # Re-ordering the spherical harmonic coefficients!
+                sh_n = (f_rest.shape[1] // 3) + 1
+                col_mapping = sum([[(j*3+0-3, j-1+3-3), (j*3+1-3,j-1+sh_n+2-3), (j*3+2-3, j-1+2*sh_n+1-3)] for j in range(1, sh_n)], [])
+                col_indices = [a for a, b in sorted(col_mapping, key=lambda x: x[1])]
+                f_rest = f_rest[:, col_indices]
+
+            opacities = np.clip(d['opacities'], 1e-8, 1.0 - 1e-8)
+            opacities = np.array(np.log(opacities) -  np.log(1.0 - opacities))
+            extras_data = [f_dc, f_rest, opacities]
+        else:
+            extras_data = [d[k] for k, dim in extras.items()]
+
+        attributes = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        if is_3dg:
+            attributes += ['f_dc_0', 'f_dc_1', 'f_dc_2']
+            for i in range(extras['sh_coeffs'] - 3):
+                attributes.append(f'f_rest_{i}')
+            attributes += ['opacity']
+        else:
+            for k, dim in extras.items():
+                for i in range(dim):
+                    attributes.append(f'{k}_{i}')
+        attributes += ['scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3']
+
+        elements = np.empty(centers.shape[0], dtype=[(attr, 'f4') for attr in attributes])
+        attributes = np.concatenate((centers, normals, *extras_data, scales, quaternions), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = plyfile.PlyElement.describe(elements, 'vertex')
+        ply_elements = [el]
+
+    # share the final file write across both representations.
+    plyfile.PlyData(ply_elements, comments=['gfields_columns_v1'] if use_columns_representation else []).write(filename)
     d['filename'] = filename
-    plyfile.PlyData([el]).write(filename)
