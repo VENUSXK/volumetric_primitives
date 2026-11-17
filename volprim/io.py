@@ -395,14 +395,17 @@ def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=F
         axial_scales = np.asarray(d['primitive_scale_y'], dtype=np.float32).reshape(-1)
         opacities = np.asarray(d['primitive_opacity'], dtype=np.float32).reshape(-1)
 
-        # check the fixed-size column layout before writing any records.
+        # read the initial group size and current variable-length column layout.
         primitives_per_column = int(d['primitives_per_column'])
         column_count = len(centers)
         primitive_count = len(axial_centers)
+        counts = np.asarray(d.get('primitive_count_per_column', np.full(column_count, primitives_per_column)))
         if centers.shape != (column_count, 2) or scales.shape != centers.shape or len(angles) != column_count:
             raise ValueError('Column centers and scales must have shape (M, 2), with one angle per column')
-        if primitives_per_column <= 0 or column_count == 0 or primitive_count != column_count * primitives_per_column:
-            raise ValueError('Primitive count must equal column count times primitives_per_column')
+        if primitives_per_column <= 0 or column_count == 0 or counts.shape != (column_count,) or counts.dtype.kind not in 'iu':
+            raise ValueError('Column primitive counts must contain one integer per column')
+        if np.any(counts <= 0) or np.any(counts > np.iinfo(np.uint32).max) or sum(map(int, counts)) != primitive_count:
+            raise ValueError('Positive column primitive counts must sum to the primitive record count')
         if axial_scales.shape != axial_centers.shape or opacities.shape != axial_centers.shape:
             raise ValueError('Axial centers, scales, and opacities must have matching lengths')
 
@@ -419,11 +422,12 @@ def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=F
             raise ValueError('Column PLY requires one uniform positive extent')
         if not len(albedo) or not np.isfinite(albedo).all() or not np.all(albedo == albedo[0]):
             raise ValueError('Column PLY requires one uniform RGB albedo')
-        metadata = np.array([(1, primitives_per_column, extent[0], *albedo[0])], dtype=[('format_version', 'u4'), ('primitives_per_column', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')])
+        metadata = np.array([(2, primitives_per_column, extent[0], *albedo[0])], dtype=[('format_version', 'u4'), ('primitives_per_column', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')])
 
         # write each shared footprint exactly once.
         column_fields = ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle')
-        column_records = np.empty(column_count, dtype=[(name, 'f4') for name in column_fields])
+        column_records = np.empty(column_count, dtype=[(name, 'f4') for name in column_fields] + [('primitive_count', 'u4')])
+        column_records['primitive_count'] = counts.astype(np.uint32)
         for name, values in zip(column_fields, (centers[:, 0], centers[:, 1], scales[:, 0], scales[:, 1], angles)):
             column_records[name] = values
 
@@ -480,5 +484,5 @@ def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=F
         ply_elements = [el]
 
     # share the final file write across both representations.
-    plyfile.PlyData(ply_elements, comments=['gfields_columns_v1'] if use_columns_representation else []).write(filename)
+    plyfile.PlyData(ply_elements, comments=['gfields_columns_v2'] if use_columns_representation else []).write(filename)
     d['filename'] = filename
