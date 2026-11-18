@@ -382,11 +382,74 @@ def object_to_dict(root):
     cb.put_object('root', root, None)
     return cb._dict['root']
 
-def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=False):
-    """Write shared columns or independent Gaussian parameters from a dictionary."""
+def _ellipsoid_ply_render_settings(d):
+    # store one uniform extent and RGB albedo for either factorized format.
+    extent = np.asarray(d.get('extent', 3.0), dtype=np.float32).reshape(-1)
+    albedo = np.asarray(d.get('albedo', [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1, 3)
+    if not extent.size or not np.isfinite(extent).all() or np.any(extent <= 0) or not np.all(extent == extent[0]):
+        raise ValueError('Factorized PLY requires one uniform positive extent')
+    if not len(albedo) or not np.isfinite(albedo).all() or not np.all(albedo == albedo[0]):
+        raise ValueError('Factorized PLY requires one uniform RGB albedo')
+    return extent[0], albedo[0]
+
+
+def _factorized_ellipsoid_ply_elements(d):
     import plyfile
 
-    if use_columns_representation:
+    # validate fixed factor counts and read compact physical parameters.
+    counts = tuple(d[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+    if any(isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count <= 0 for count in counts):
+        raise ValueError('FGC requires positive integer group and factor counts')
+    group_count, xz_count, y_count = map(int, counts)
+    centers = np.asarray(d['column_center_xz'], dtype=np.float32)
+    scales = np.asarray(d['column_scale_xz'], dtype=np.float32)
+    arrays = {name: np.asarray(d[name], dtype=np.float32).reshape(-1) for name in
+              ('column_rotation_angle', 'xz_weight', 'primitive_center_y', 'primitive_scale_y', 'y_weight', 'group_opacity')}
+
+    # reject malformed arrays before writing contiguous per-group factor records.
+    widths = {'column_rotation_angle': group_count * xz_count, 'xz_weight': group_count * xz_count,
+              'primitive_center_y': group_count * y_count, 'primitive_scale_y': group_count * y_count,
+              'y_weight': group_count * y_count, 'group_opacity': group_count}
+    if centers.shape != (group_count * xz_count, 2) or scales.shape != centers.shape:
+        raise ValueError('FGC XZ centers and scales must have shape (R * J, 2)')
+    if any(len(arrays[name]) != width for name, width in widths.items()):
+        raise ValueError('FGC parameter widths do not match R, J, K')
+    if not all(np.isfinite(values).all() for values in (centers, scales, *arrays.values())):
+        raise ValueError('FGC parameters must be finite')
+    if np.any(scales <= 0) or np.any(arrays['primitive_scale_y'] <= 0) or np.any(arrays['group_opacity'] < 0):
+        raise ValueError('FGC requires positive scales and nonnegative group opacity')
+    for name, count in (('xz_weight', xz_count), ('y_weight', y_count)):
+        if np.any(arrays[name] < 0) or not np.allclose(arrays[name].reshape(group_count, count).sum(axis=1), 1.0, rtol=1e-5, atol=1e-6):
+            raise ValueError('FGC mixture weights must be nonnegative and normalized within each group')
+
+    # identify the FGC format and store file-wide rendering settings once.
+    extent, albedo = _ellipsoid_ply_render_settings(d)
+    metadata_fields = [('format_version', 'u4'), ('group_count', 'u4'), ('xz_gaussians_per_group', 'u4'),
+                       ('y_gaussians_per_group', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')]
+    metadata = np.array([(3, group_count, xz_count, y_count, extent, *albedo)], dtype=metadata_fields)
+    groups = np.empty(group_count, dtype=[('opacity', 'f4')])
+    groups['opacity'] = arrays['group_opacity']
+
+    # save XZ and Y factors without materializing their Cartesian product.
+    xz_fields = ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle', 'weight')
+    xz = np.empty(group_count * xz_count, dtype=[(name, 'f4') for name in xz_fields])
+    for name, values in zip(xz_fields, (centers[:, 0], centers[:, 1], scales[:, 0], scales[:, 1], arrays['column_rotation_angle'], arrays['xz_weight'])):
+        xz[name] = values
+    y = np.empty(group_count * y_count, dtype=[('center_y', 'f4'), ('scale_y', 'f4'), ('weight', 'f4')])
+    for field, name in (('center_y', 'primitive_center_y'), ('scale_y', 'primitive_scale_y'), ('weight', 'y_weight')):
+        y[field] = arrays[name]
+    return [plyfile.PlyElement.describe(records, name) for name, records in (('metadata', metadata), ('group', groups), ('xz', xz), ('y', y))]
+
+
+def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=False, use_factorized_columns_representation=False):
+    """Write Column factors, FGC factors, or independent Gaussians from a dictionary."""
+    import plyfile
+
+    if use_columns_representation and use_factorized_columns_representation:
+        raise ValueError('Choose either Column or FGC PLY representation')
+    if use_factorized_columns_representation:
+        ply_elements = _factorized_ellipsoid_ply_elements(d)
+    elif use_columns_representation:
         # read shared footprints and independent axial parameters from the dictionary.
         centers = np.asarray(d['column_center_xz'], dtype=np.float32)
         scales = np.asarray(d['column_scale_xz'], dtype=np.float32)
@@ -416,13 +479,8 @@ def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=F
             raise ValueError('Column and primitive scales must be positive')
 
         # store uniform rendering attributes once for the entire file.
-        extent = np.asarray(d.get('extent', 3.0), dtype=np.float32).reshape(-1)
-        albedo = np.asarray(d.get('albedo', [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1, 3)
-        if not extent.size or not np.isfinite(extent).all() or np.any(extent <= 0) or not np.all(extent == extent[0]):
-            raise ValueError('Column PLY requires one uniform positive extent')
-        if not len(albedo) or not np.isfinite(albedo).all() or not np.all(albedo == albedo[0]):
-            raise ValueError('Column PLY requires one uniform RGB albedo')
-        metadata = np.array([(2, primitives_per_column, extent[0], *albedo[0])], dtype=[('format_version', 'u4'), ('primitives_per_column', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')])
+        extent, albedo = _ellipsoid_ply_render_settings(d)
+        metadata = np.array([(2, primitives_per_column, extent, *albedo)], dtype=[('format_version', 'u4'), ('primitives_per_column', 'u4'), ('extent', 'f4'), ('albedo_r', 'f4'), ('albedo_g', 'f4'), ('albedo_b', 'f4')])
 
         # write each shared footprint exactly once.
         column_fields = ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle')
@@ -484,5 +542,6 @@ def ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=F
         ply_elements = [el]
 
     # share the final file write across both representations.
-    plyfile.PlyData(ply_elements, comments=['gfields_columns_v2'] if use_columns_representation else []).write(filename)
+    comments = ['gfields_fgc_v3'] if use_factorized_columns_representation else (['gfields_columns_v2'] if use_columns_representation else [])
+    plyfile.PlyData(ply_elements, comments=comments).write(filename)
     d['filename'] = filename
